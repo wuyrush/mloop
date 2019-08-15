@@ -4,8 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
+	"github.com/faiface/beep"
 	"github.com/faiface/beep/mp3"
 	"github.com/faiface/beep/speaker"
 	log "github.com/sirupsen/logrus"
@@ -72,3 +74,29 @@ func loop(dir string, _ <-chan time.Time) {
 	speaker.Play(streamer)
 	select {}
 }
+
+func iteratorFunc(dir string) func() beep.Streamer {
+	// get paths of all direct descendants of dir
+	paths := make([]string)
+	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		// skip if p points to a directory
+		if info.IsDir() {
+			return filepath.SkipDir
+		}
+		paths = append(paths, p)
+		return nil
+	})
+	pointer := 0
+	return func() beep.Streamer {
+		// generate a streamer via Seq(), which compose the real streamer and
+		// a dummy streamer(beep.Callback) to close the real streamer together
+	}
+}
+
+/*
+1. walk all the files of the most shallow level in the given directory
+2. Have a pointer to point to the file being played currently
+3. have a function to loop generating a streamer based on the file pointer
+4. pass the function to beep.Iterate() so that it produces a looping streamer
+5. play the streamer we got from 4).
+*/
