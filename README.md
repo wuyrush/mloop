@@ -45,7 +45,8 @@ Usage of mloop:
 ## TODOs 
 
 ### 08/17/19
-* Accept single audio file as input as well.
-* Consider playable audio files only; For now `mloop` will complain and exit if it processes a file it cannot play.
+* Accept single audio file as input as well
+* Support more codecs
+* Consider playable audio files only; For now `mloop` will complain and exit if it processes a file it cannot play
 * The only play order supported by `mloop` is ascending lexico order based on audio file filenames; maybe add an option for random order?
 
