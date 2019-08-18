@@ -48,12 +48,12 @@ func (tp *timepoint) Set(s string) error {
 
 func main() {
 	var (
-		ad      = flag.String("dir", "", "Path to audio file directory")
-		d       = flag.Duration("d", 0*time.Second, "Amount of time to loop playing the given audio files")
+		ad      = flag.String("dir", ".", "Path to audio file directory. Default to current directory")
+		d       = flag.Duration("d", 0*time.Second, "Amount of time to loop playing the given audio files. Default to 0")
 		start   = timepoint(time.Now())
 		verbose = flag.Bool("v", false, "Turn on verbose mode")
 	)
-	flag.Var(&start, "s", "start time in HH:MM format")
+	flag.Var(&start, "s", "start time in HH:MM format. Default to current time")
 	flag.Parse()
 	// setup logging
 	log.SetOutput(os.Stdout)
@@ -80,7 +80,7 @@ func main() {
 		}
 	}
 	// initialize speaker. Note beep.speaker has fixed sample rate
-	speaker.Init(SpeakerSampleRate, SpeakerSampleRate.N(time.Second/10))
+	speaker.Init(SpeakerSampleRate, SpeakerSampleRate.N(time.Second/5))
 	timer := time.NewTimer(*d)
 	exit := make(chan struct{})
 	var wg sync.WaitGroup
@@ -100,6 +100,10 @@ func main() {
 	log.Info("main exits")
 }
 
+// Builds a closure to loop playing audio files in the given directory and be responsive to exit signals. An
+// alternative of this is composing beep.Seq/Iterate/Loop, which seems less work and more reasonable. However
+// I ditch it since I don't like having idle file descriptors open, which can be problematic  if there are
+// many audio files in the given directory.
 func loopFunc(dir string, exit <-chan struct{}) func(*sync.WaitGroup) {
 	// get paths of all direct descendants of dir
 	var paths []string
@@ -120,37 +124,39 @@ func loopFunc(dir string, exit <-chan struct{}) func(*sync.WaitGroup) {
 		defer wg.Done()
 		for {
 			p := paths[idx]
-			cont := func() bool {
-				clog := log.WithField("filepath", p)
-				f, err := os.Open(p)
-				if err != nil {
-					clog.WithError(err).Fatal("error open file")
-				}
-				streamer, format, err := mp3.Decode(f)
-				if err != nil {
-					clog.WithError(err).Fatal("error decoding file with mp3 codec")
-				}
-				defer streamer.Close()
-
-				resampled := beep.Resample(ResampleQualifyIdx, format.SampleRate, SpeakerSampleRate, streamer)
-				speaker.Play(beep.Seq(resampled, beep.Callback(func() {
-					select {
-					case <-exit:
-					case done <- true:
-					}
-				})))
-				// wait till either the current song playback finishes or exit signal comes
-				select {
-				case <-exit:
-					return false
-				case <-done:
-					return true
-				}
-			}()
+			cont := play(p, exit, done)
 			if !cont {
 				return
 			}
 			idx = (idx + 1) % len(paths)
 		}
+	}
+}
+
+func play(p string, exit <-chan struct{}, done chan bool) bool {
+	clog := log.WithField("filepath", p)
+	f, err := os.Open(p)
+	if err != nil {
+		clog.WithError(err).Fatal("error open file")
+	}
+	streamer, format, err := mp3.Decode(f)
+	if err != nil {
+		clog.WithError(err).Fatal("error decoding file with mp3 codec")
+	}
+	defer streamer.Close()
+
+	resampled := beep.Resample(ResampleQualifyIdx, format.SampleRate, SpeakerSampleRate, streamer)
+	speaker.Play(beep.Seq(resampled, beep.Callback(func() {
+		select {
+		case <-exit:
+		case done <- true:
+		}
+	})))
+	// wait till either the current song playback finishes or exit signal comes
+	select {
+	case <-exit:
+		return false
+	case <-done:
+		return true
 	}
 }
