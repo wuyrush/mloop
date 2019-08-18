@@ -1,4 +1,4 @@
-# `mloop` - Loop playing music in a given directory
+# `mloop` - Loop playing music
 
 ## What?
 
