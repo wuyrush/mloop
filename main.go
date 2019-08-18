@@ -4,7 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"sync"
+	"syscall"
 	"time"
 
 	"github.com/faiface/beep"
@@ -13,19 +16,23 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	ResampleQualifyIdx = 4
+	SpeakerSampleRate  = beep.SampleRate(48000)
+	StartTimeFormat    = "15:04"
+)
+
 func init() {
-	log.SetOutput(os.Stdout)
-	log.SetLevel(log.DebugLevel)
 }
 
 type timepoint time.Time
 
 func (tp *timepoint) String() string {
-	return time.Time(*tp).String()
+	return time.Time(*tp).Format(StartTimeFormat)
 }
 
 func (tp *timepoint) Set(s string) error {
-	t, err := time.Parse("15:04", s)
+	t, err := time.Parse(StartTimeFormat, s)
 	if err != nil {
 		return err
 	}
@@ -41,62 +48,109 @@ func (tp *timepoint) Set(s string) error {
 
 func main() {
 	var (
-		ad    = flag.String("dir", "", "Path to audio file directory")
-		d     = flag.Duration("duration", 0*time.Second, "Loop playing the given audio files for how long?")
-		start timepoint
+		ad      = flag.String("dir", "", "Path to audio file directory")
+		d       = flag.Duration("d", 0*time.Second, "Amount of time to loop playing the given audio files")
+		start   = timepoint(time.Now())
+		verbose = flag.Bool("v", false, "Turn on verbose mode")
 	)
-	flag.Var(&start, "start", "start time in HH:MM format")
-
+	flag.Var(&start, "s", "start time in HH:MM format")
 	flag.Parse()
-	log.Infof("Loop playing audio files in %s for %s, starting at %s", *ad, *d, &start)
+	// setup logging
+	log.SetOutput(os.Stdout)
+	log.SetLevel(log.InfoLevel)
+	if *verbose {
+		log.SetLevel(log.DebugLevel)
+	}
+	// get the absolute filepath of audio file dir
+	dir, err := filepath.Abs(*ad)
+	if err != nil {
+		log.WithError(err).Fatal("failed to get the absolute path of audio file directory")
+	}
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
+	log.Infof("Loop playing audio files in %s for %s, starting at %s", dir, *d, &start)
+	if time.Now().Before(time.Time(start)) {
+		log.Infof("Wait till %s", &start)
+		select {
+		case sig := <-sigChan:
+			log.WithField("signal", sig).Info("got exit signal while waiting. Exit")
+			return
+		case <-time.After(time.Time(start).Sub(time.Now())):
+		}
+	}
+	// initialize speaker. Note beep.speaker has fixed sample rate
+	speaker.Init(SpeakerSampleRate, SpeakerSampleRate.N(time.Second/10))
 	timer := time.NewTimer(*d)
-	// spawn a goroutine to 1) loop play music and 2) listen to timer signal for exit
-	// when the goroutine exit, inform the waiting main goroutine to exit as well
-	loop(*ad, timer.C)
+	exit := make(chan struct{})
+	var wg sync.WaitGroup
+	f := loopFunc(dir, exit)
+	wg.Add(1)
+	go f(&wg)
+
+	select {
+	case sig := <-sigChan:
+		log.WithField("signal", sig).Info("got exit signal")
+	case <-timer.C:
+		log.Info("play time's up")
+	}
+	// notify the looping goroutine to exit and
+	close(exit)
+	wg.Wait()
+	log.Info("main exits")
 }
 
-func loop(dir string, _ <-chan time.Time) {
-	// assume dir points to an audio file, testing beep
-	clog := log.WithField("file", dir)
-	f, err := os.Open(dir)
-	if err != nil {
-		clog.WithError(err).Error("error opening file")
-		return
-	}
-	streamer, format, err := mp3.Decode(f)
-	if err != nil {
-		clog.WithError(err).Errorf("error decoding file")
-		return
-	}
-	defer streamer.Close()
-	speaker.Init(format.SampleRate, format.SampleRate.N(time.Second/10))
-	speaker.Play(streamer)
-	select {}
-}
-
-func iteratorFunc(dir string) func() beep.Streamer {
+func loopFunc(dir string, exit <-chan struct{}) func(*sync.WaitGroup) {
 	// get paths of all direct descendants of dir
-	paths := make([]string)
+	var paths []string
 	filepath.Walk(dir, func(p string, info os.FileInfo, err error) error {
+		log.Debugf("walk %s", p)
 		// skip if p points to a directory
-		if info.IsDir() {
+		if p == dir {
+			return nil
+		} else if info.IsDir() {
 			return filepath.SkipDir
 		}
 		paths = append(paths, p)
 		return nil
 	})
-	pointer := 0
-	return func() beep.Streamer {
-		// generate a streamer via Seq(), which compose the real streamer and
-		// a dummy streamer(beep.Callback) to close the real streamer together
+	log.WithField("files", paths).Debugf("done enumerating files in directory %s", dir)
+	idx, done := 0, make(chan bool)
+	return func(wg *sync.WaitGroup) {
+		defer wg.Done()
+		for {
+			p := paths[idx]
+			cont := func() bool {
+				clog := log.WithField("filepath", p)
+				f, err := os.Open(p)
+				if err != nil {
+					clog.WithError(err).Fatal("error open file")
+				}
+				streamer, format, err := mp3.Decode(f)
+				if err != nil {
+					clog.WithError(err).Fatal("error decoding file with mp3 codec")
+				}
+				defer streamer.Close()
+
+				resampled := beep.Resample(ResampleQualifyIdx, format.SampleRate, SpeakerSampleRate, streamer)
+				speaker.Play(beep.Seq(resampled, beep.Callback(func() {
+					select {
+					case <-exit:
+					case done <- true:
+					}
+				})))
+				// wait till either the current song playback finishes or exit signal comes
+				select {
+				case <-exit:
+					return false
+				case <-done:
+					return true
+				}
+			}()
+			if !cont {
+				return
+			}
+			idx = (idx + 1) % len(paths)
+		}
 	}
 }
-
-/*
-1. walk all the files of the most shallow level in the given directory
-2. Have a pointer to point to the file being played currently
-3. have a function to loop generating a streamer based on the file pointer
-4. pass the function to beep.Iterate() so that it produces a looping streamer
-5. play the streamer we got from 4).
-*/
